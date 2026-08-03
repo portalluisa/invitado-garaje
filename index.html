@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Acceso Invitado - Garatge</title>
+  <script src="https://cdn.jsdelivr.net/npm/mqtt/dist/mqtt.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: Arial, sans-serif; background: #1a1a2e; color: #eee; min-height: 100vh; display: flex; justify-content: center; align-items: flex-start; padding-top: 40px; }
+    .container { text-align: center; padding: 20px 30px; width: 100%; max-width: 380px; }
+    h1 { font-size: 22px; color: #aaa; letter-spacing: 3px; text-transform: uppercase; margin-bottom: 6px; }
+    .subtitulo { font-size: 13px; color: #555; margin-bottom: 16px; }
+    .estado-mqtt { font-size: 13px; padding: 6px 16px; border-radius: 20px; display: inline-block; margin-bottom: 30px; }
+    .conectado    { background: #1a4a1a; color: #4ecca3; border: 1px solid #4ecca3; }
+    .desconectado { background: #4a1a1a; color: #e94560; border: 1px solid #e94560; }
+    .conectando   { background: #3a3a1a; color: #f0c040; border: 1px solid #f0c040; }
+    .btn-abrir {
+      background: radial-gradient(circle at 35% 35%, #ff6b6b, #e94560);
+      color: white; border: none; border-radius: 50%;
+      width: 150px; height: 150px; font-size: 20px; font-weight: bold;
+      cursor: pointer; letter-spacing: 2px;
+      box-shadow: 0 0 30px rgba(233,69,96,0.4);
+      transition: all 0.15s; display: block; margin: 0 auto 20px;
+    }
+    .btn-abrir:active:not(:disabled) { transform: scale(0.93); }
+    .btn-abrir:disabled { background: radial-gradient(circle at 35% 35%, #555, #444); box-shadow: none; cursor: not-allowed; }
+    .btn-abrir.abierto { background: radial-gradient(circle at 35% 35%, #4ecca3, #2eaa83); box-shadow: 0 0 30px rgba(78,204,163,0.5); }
+    .btn-abrir.error   { background: radial-gradient(circle at 35% 35%, #e94560, #c0392b); }
+    .status { font-size: 14px; min-height: 20px; color: #aaa; margin-bottom: 20px; }
+    .status.ok  { color: #4ecca3; }
+    .status.err { color: #e94560; }
+    
+    /* --- TIEMPO RESTANTE / CADUCADO --- */
+    .tiempo-restante { font-size: 13px; color: #f0c040; margin-top: 6px; min-height: 18px; transition: all 0.3s ease; }
+    .tiempo-restante.caducado { font-size: 16px; font-weight: bold; }
+
+    /* --- ESTADOS DE LA PUERTA --- */
+    .puerta-estado {
+      font-size: 14px; padding: 6px 16px; border-radius: 20px;
+      display: inline-block; margin-bottom: 16px; transition: all 0.5s;
+    }
+    .puerta-abierta { background: #1a4a1a; color: #4ecca3; border: 1px solid #4ecca3; }
+    .puerta-cerrada { background: #4a1a1a; color: #fff;    border: 1px solid #e94560; }
+    .puerta-unknown { display: none; }
+    .acceso-denegado { padding: 20px; background: #4a1a1a; border: 1px solid #e94560; border-radius: 8px; color: #e94560; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1>ENTRADA GARATGE</h1>
+  <div class="subtitulo" id="subtitulo">Accés de convidat</div>
+  <div class="estado-mqtt desconectado" id="estadoMqtt">● Desconnectat</div>
+  <div class="puerta-estado puerta-unknown" id="puertaEstado"></div>
+  <button class="btn-abrir" id="btnAbrir" onclick="abrir()" disabled>OBRIR</button>
+  <div class="status" id="status"></div>
+  <div class="tiempo-restante" id="tiempoRestante"></div>
+  <div class="acceso-denegado" id="accesoDenegado" style="display:none">
+    <p>Accés denegat. Token invàlid o expirat.</p>
+  </div>
+</div>
+
+<script>
+  var BROKER         = "wss://d3c63be4f2464ff7a1d80943eae17c28.s1.eu.hivemq.cloud:8884/mqtt";
+  var USER           = "Jordi";
+  var PASS           = "1923Jtlcom.";
+
+  var client = null;
+  var tokenInvitado = "";
+  var minutosRestantes = 0;
+  var timerInterval = null;
+
+  function formatTiempo(minutos) {
+    if (minutos <= 0) return "Accés caducat";
+    var h = Math.floor(minutos / 60);
+    var m = minutos % 60;
+    if (h > 0) return "Accés vàlid: " + h + "h " + m + "min";
+    return "Accés vàlid: " + m + " min";
+  }
+
+  function iniciarCuentaAtras(minutos) {
+    minutosRestantes = minutos;
+    var elTiempo = document.getElementById("tiempoRestante");
+    elTiempo.textContent = formatTiempo(minutosRestantes);
+    if (timerInterval) clearInterval(timerInterval);
+    timerInterval = setInterval(function() {
+      minutosRestantes--;
+      if (minutosRestantes <= 0) {
+        elTiempo.textContent = "⚠ Accés caducat";
+        elTiempo.style.color = "#e94560";
+        elTiempo.classList.add("caducado");
+        document.getElementById("btnAbrir").disabled = true;
+        clearInterval(timerInterval);
+      } else {
+        elTiempo.textContent = formatTiempo(minutosRestantes);
+      }
+    }, 60000);
+  }
+
+  function getToken() {
+    var params = new URLSearchParams(window.location.search);
+    return params.get("t") ? params.get("t").toUpperCase() : "";
+  }
+
+  function setEstado(s) {
+    var el = document.getElementById("estadoMqtt");
+    var btn = document.getElementById("btnAbrir");
+    if (s === "conectado") {
+      el.textContent = "● Connectat"; el.className = "estado-mqtt conectado";
+      btn.disabled = false;
+    } else if (s === "conectando") {
+      el.textContent = "● Connectant..."; el.className = "estado-mqtt conectando";
+      btn.disabled = true;
+    } else {
+      el.textContent = "● Desconnectat"; el.className = "estado-mqtt desconectado";
+      btn.disabled = true;
+    }
+  }
+
+  function conectar() {
+    setEstado("conectando");
+    var clientId = "web_garaje_inv_" + Math.random().toString(16).substr(2, 8);
+    client = mqtt.connect(BROKER, { clientId: clientId, username: USER, password: PASS, reconnectPeriod: 5000, keepalive: 30 });
+
+    client.on("connect", function() {
+      setEstado("conectado");
+      client.subscribe("garaje3/confirmacion");
+      client.subscribe("garaje3/token_ok");
+      client.subscribe("garaje3/tiempo_token");
+      client.subscribe("garaje3/puerta");
+      if (tokenInvitado) client.publish("garaje3/consulta_token", tokenInvitado);
+    });
+
+    client.on("error", function() { setEstado("desconectado"); });
+    client.on("offline", function() { setEstado("desconectado"); });
+
+    client.on("message", function(topic, payload) {
+      var msg = payload.toString();
+      var btn = document.getElementById("btnAbrir");
+      var st  = document.getElementById("status");
+      var elTiempo = document.getElementById("tiempoRestante");
+
+      if (topic === "garaje3/tiempo_token") {
+        var mins = parseInt(msg);
+        if (mins > 0) {
+          elTiempo.classList.remove("caducado");
+          elTiempo.style.color = "#f0c040";
+          iniciarCuentaAtras(mins);
+        } else {
+          elTiempo.textContent = "⚠ Accés caducat";
+          elTiempo.style.color = "#e94560";
+          elTiempo.classList.add("caducado");
+          document.getElementById("btnAbrir").disabled = true;
+        }
+      }
+
+      if (topic === "garaje3/puerta") {
+        var el = document.getElementById("puertaEstado");
+        if (msg === "abierta") {
+          el.textContent = "▲ Porta oberta";
+          el.className = "puerta-estado puerta-abierta";
+        } else {
+          el.textContent = "▼ Porta tancada";
+          el.className = "puerta-estado puerta-cerrada";
+        }
+      }
+
+      if (topic === "garaje3/confirmacion" && msg === "1") {
+        st.textContent = "✓ Porta oberta confirmada"; st.className = "status ok";
+        setTimeout(function() { st.textContent = ""; st.className = "status"; }, 5000);
+      }
+
+      if (topic === "garaje3/token_ok") {
+        btn.disabled = false;
+        if (msg === "1") {
+          btn.classList.remove("error"); btn.classList.add("abierto"); btn.textContent = "✓";
+          st.textContent = "✓ Accés concedit"; st.className = "status ok";
+          setTimeout(function() { btn.classList.remove("abierto"); btn.textContent = "OBRIR"; st.textContent = ""; st.className = "status"; }, 3000);
+        } else {
+          btn.classList.add("error"); btn.textContent = "✗";
+          st.textContent = "Token invàlid o caducat"; st.className = "status err";
+          setTimeout(function() { btn.classList.remove("error"); btn.textContent = "OBRIR"; st.textContent = ""; st.className = "status"; }, 4000);
+        }
+      }
+    });
+  }
+
+  function abrir() {
+    if (!client || !client.connected) return;
+    var btn = document.getElementById("btnAbrir");
+    var st  = document.getElementById("status");
+    btn.disabled = true; btn.textContent = "...";
+    st.textContent = "Validant accés...";
+    st.className = "status ok";
+    client.publish("garaje3/invitado", tokenInvitado);
+  }
+
+  window.onload = function() {
+    tokenInvitado = getToken();
+    if (!tokenInvitado) {
+      document.getElementById("accesoDenegado").style.display = "block";
+      document.getElementById("btnAbrir").style.display = "none";
+      document.getElementById("tiempoRestante").style.display = "none";
+      document.getElementById("puertaEstado").style.display = "none";
+      return;
+    }
+    conectar();
+  };
+</script>
+</body>
+</html>
