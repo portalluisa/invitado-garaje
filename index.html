@@ -30,10 +30,27 @@
     .status { font-size: 14px; min-height: 20px; color: #aaa; margin-bottom: 20px; }
     .status.ok  { color: #4ecca3; }
     .status.err { color: #e94560; }
-    
+
     /* --- TIEMPO RESTANTE / CADUCADO --- */
     .tiempo-restante { font-size: 13px; color: #f0c040; margin-top: 6px; min-height: 18px; transition: all 0.3s ease; }
     .tiempo-restante.caducado { font-size: 16px; font-weight: bold; }
+
+    /* --- AUTODESTRUCCIÓN (modo película) --- */
+    .autodestruccio {
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      background: #0d0d0d; z-index: 9999;
+      display: flex; flex-direction: column; justify-content: center; align-items: center;
+      text-align: center; padding: 20px;
+    }
+    .autodestruccio .titol {
+      font-size: 18px; font-weight: bold; color: #e94560; letter-spacing: 2px;
+      animation: parpadeo 1s infinite; margin-bottom: 12px;
+    }
+    .autodestruccio .compte { font-size: 46px; font-weight: bold; color: #ff9f1c; }
+    .autodestruccio .final {
+      font-size: 14px; color: #555; letter-spacing: 1px; margin-top: 24px; line-height: 1.6;
+    }
+    @keyframes parpadeo { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
 
     /* --- ESTADOS DE LA PUERTA --- */
     .puerta-estado {
@@ -68,33 +85,78 @@
   var client = null;
   var tokenInvitado = "";
   var minutosRestantes = 0;
+  var usosRestantes = 0;
   var timerInterval = null;
 
-  function formatTiempo(minutos) {
+  function formatTiempo(minutos, usos) {
     if (minutos <= 0) return "Accés caducat";
+    var txt = "";
     var h = Math.floor(minutos / 60);
     var m = minutos % 60;
-    if (h > 0) return "Accés vàlid: " + h + "h " + m + "min";
-    return "Accés vàlid: " + m + " min";
+    if (h > 0) txt = h + "h " + m + "min";
+    else       txt = m + " min";
+    if (typeof usos === "number" && usos >= 0) {
+      txt += " · " + (usos === 1 ? "1 obertura restant" : usos + " obertures");
+    }
+    return "Accés vàlid: " + txt;
   }
 
-  function iniciarCuentaAtras(minutos) {
+  function iniciarCuentaAtras(minutos, usos) {
     minutosRestantes = minutos;
+    usosRestantes    = usos;
     var elTiempo = document.getElementById("tiempoRestante");
-    elTiempo.textContent = formatTiempo(minutosRestantes);
+    elTiempo.textContent = formatTiempo(minutosRestantes, usosRestantes);
     if (timerInterval) clearInterval(timerInterval);
     timerInterval = setInterval(function() {
       minutosRestantes--;
       if (minutosRestantes <= 0) {
-        elTiempo.textContent = "⚠ Accés caducat";
-        elTiempo.style.color = "#e94560";
-        elTiempo.classList.add("caducado");
-        document.getElementById("btnAbrir").disabled = true;
         clearInterval(timerInterval);
+        autodestruccio("temps");
       } else {
-        elTiempo.textContent = formatTiempo(minutosRestantes);
+        elTiempo.textContent = formatTiempo(minutosRestantes, usosRestantes);
       }
     }, 60000);
+  }
+
+  // ── Secuencia de autodestrucción ─────────────────────────────
+  // Fase 1 (visible): cuenta atrás 5s en pantalla negra
+  // Fase 2 (real):    se corta la conexión al broker (client.end)
+  // Fase 3 (visible): se borra TODO el contenido de la página
+  // Fase 4:           mensaje final. Recargar no sirve: el token
+  //                   sigue caducado (o agotado) en el firmware del C3.
+  function autodestruccio(motiu) {
+    document.getElementById("btnAbrir").disabled = true;
+    if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
+    if (client) client.end(true);
+
+    var titol = "⚠ AQUEST ENLLAÇ S'AUTODESTRUEIX EN";
+    var finalMsg = "L'accés al garatge ha caducat.<br>Aquest enllaç ja no funciona.";
+
+    if (motiu === "usos") {
+      titol    = "⚠ MISSIÓ COMPLETADA. L'ENLLAÇ S'AUTODESTRUEIX EN";
+      finalMsg = "Has esgotat les 4 obertures.<br>Aquest enllaç ja no funciona.";
+    }
+
+    var velo = document.createElement("div");
+    velo.className = "autodestruccio";
+    velo.innerHTML =
+      '<div class="titol">' + titol + '</div>' +
+      '<div class="compte" id="compteFinal">5</div>' +
+      '<div class="final"></div>';
+    document.body.appendChild(velo);
+
+    var seg = 5;
+    var compte = document.getElementById("compteFinal");
+    var iv = setInterval(function() {
+      seg--;
+      if (seg > 0) {
+        compte.textContent = seg;
+      } else {
+        clearInterval(iv);
+        document.body.innerHTML =
+          '<div class="autodestruccio"><div class="final">' + finalMsg + '</div></div>';
+      }
+    }, 1000);
   }
 
   function getToken() {
@@ -141,16 +203,20 @@
       var elTiempo = document.getElementById("tiempoRestante");
 
       if (topic === "garaje3/tiempo_token") {
-        var mins = parseInt(msg);
-        if (mins > 0) {
+        // Formato "minutos|usos" (compatible con solo minutos)
+        var partes = msg.split("|");
+        var mins = parseInt(partes[0]);
+        var usos = partes.length > 1 ? parseInt(partes[1]) : -1;
+
+        if (mins > 0 && usos > 0) {
           elTiempo.classList.remove("caducado");
           elTiempo.style.color = "#f0c040";
-          iniciarCuentaAtras(mins);
+          iniciarCuentaAtras(mins, usos);
+        } else if (usos === 0) {
+          // Ha consumido la última obertura justo ahora: dejar ver el ✓ y explotar
+          setTimeout(function() { autodestruccio("usos"); }, 2500);
         } else {
-          elTiempo.textContent = "⚠ Accés caducat";
-          elTiempo.style.color = "#e94560";
-          elTiempo.classList.add("caducado");
-          document.getElementById("btnAbrir").disabled = true;
+          autodestruccio("temps");
         }
       }
 
